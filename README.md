@@ -41,6 +41,23 @@ Restart the gateway / start a new session; `image_generate` and video
 generation now go through the relay. Catalogs are read live from the relay's
 `/models`, so newly added media models appear without a plugin update.
 
+### Wire-contract notes (verified against CLIProxyAPI sources)
+
+- **Image edits** (`/images/edits`, JSON): payload uses
+  `images: [{"image_url": <url>}]` — the one shape parsed by both the xAI
+  branch and the generic fallback.
+- **Video** (`/v1/videos/generations`, the NATIVE xAI path — the relay
+  forwards the JSON to xAI untranslated): numeric `duration`,
+  `image: {"url": ...}` for image-to-video, `reference_images: [{"url": ...}]`,
+  plus `aspect_ratio`/`resolution` (without them everything defaults to
+  720x1280 portrait). The OpenAI-style `seconds`/`input_reference` spellings
+  are only translated on `/openai/v1/videos` and are NOT used here.
+- `image_url` and `reference_image_urls` are mutually exclusive upstream;
+  the plugin prefers `image_url` and logs a warning.
+- Polling reuses the SAME Bearer key as submit (relay auth-binding) and fails
+  fast after 6 consecutive 4xx responses instead of spinning to the 15-minute
+  deadline.
+
 ## Relay endpoint coverage (probed against CLIProxyAPI)
 
 | Endpoint | Status | Effect |
