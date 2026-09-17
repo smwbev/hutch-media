@@ -1,0 +1,8 @@
+name: hutch-media
+kind: backend
+version: 1.0.0
+description: "Hutch relay media backends: image generation (OpenRouter-compatible chat + /images API surfaces) and video generation (async /videos submit-poll), catalogs discovered live from the relay."
+author: Evgenii (smwbev)
+homepage: https://github.com/smwbev/hutch-media
+requires_env:
+  - HUTCH_API_KEY
