@@ -6,3 +6,4 @@ author: Evgenii (smwbev)
 homepage: https://github.com/smwbev/hutch-media
 requires_env:
   - HUTCH_API_KEY
+  - HUTCH_BASE_URL
