@@ -133,6 +133,12 @@ def _inline_image_ref(value: str) -> str:
     bundled xAI/OpenRouter providers: pass URLs and data URIs through, read a
     local file behind the shared credential-read guard and inline it as a
     base64 data URI.
+
+    Large files are re-encoded first (see ``_compress_for_inline``): Hermes'
+    cache emits 2–3 MB PNGs and the relay rejects a 3 MB+ body on
+    ``/videos/generations`` with "length limit exceeded", so the standard
+    "generate → animate" flow died on the transport. Small files are inlined
+    byte-exact.
     """
     ref = (value or "").strip()
     if not ref:
@@ -145,11 +151,67 @@ def _inline_image_ref(value: str) -> str:
         return ref  # not a local file — let the relay report the real error
     from agent.file_safety import raise_if_read_blocked
     raise_if_read_blocked(str(path))
+    raw = path.read_bytes()
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     if not mime.startswith("image/"):
         mime = "image/png"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    if len(raw) > _INLINE_MAX_RAW_BYTES:
+        raw, mime = _compress_for_inline(raw, mime)
+    encoded = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+# Inline budget: base64 inflates by 4/3, and the relay's request-body limit
+# on /videos/generations bit at ~3 MB of data URI (a 2.28 MB PNG failed, a
+# 110 KB JPEG passed). Keep the encoded payload comfortably under 1 MB.
+_INLINE_MAX_RAW_BYTES = 768 * 1024        # ~1 MB after base64
+_INLINE_MAX_SIDE_PX = 1536
+_INLINE_JPEG_QUALITY = 85
+
+
+def _compress_for_inline(raw: bytes, mime: str) -> Tuple[bytes, str]:
+    """Shrink an oversized image for data-URI transport.
+
+    Downscale so the long side is ≤ ``_INLINE_MAX_SIDE_PX`` and re-encode as
+    JPEG q85 (alpha flattened onto white — the relay's media models take
+    opaque input anyway). If the result is still over budget, step quality
+    down. Pillow is a core Hermes dependency; if decoding fails the original
+    bytes are returned untouched so the relay reports the real problem.
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+        with Image.open(BytesIO(raw)) as img:
+            img.load()
+            # Honour EXIF orientation before resizing: the re-encoded JPEG
+            # carries no EXIF, so a phone photo would otherwise arrive rotated.
+            img = ImageOps.exif_transpose(img) or img
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.getchannel("A"))
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            scale = _INLINE_MAX_SIDE_PX / max(w, h)
+            if scale < 1.0:
+                img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                                 Image.Resampling.LANCZOS)
+            quality = _INLINE_JPEG_QUALITY
+            while True:
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                out = buf.getvalue()
+                if len(out) <= _INLINE_MAX_RAW_BYTES or quality <= 50:
+                    break
+                quality -= 10
+            logger.debug("hutch media: inlined image re-encoded %s→%s bytes (q=%d, %dx%d)",
+                         len(raw), len(out), quality, *img.size)
+            return out, "image/jpeg"
+    except Exception as exc:  # pragma: no cover - defensive: undecodable input
+        logger.debug("hutch media: image re-encode skipped (%s); sending original", exc)
+        return raw, mime
 
 
 # Hermes canonical aspect names → relay ``size`` (the xAI branch derives
@@ -161,6 +223,30 @@ _IMAGE_SIZES: Dict[str, str] = {
     "square": "1024x1024",
     "portrait": "1024x1536",
 }
+
+
+def _measure_aspect(image: str) -> Tuple[str, Optional[Tuple[int, int]]]:
+    """Canonical aspect name for a LOCAL image file, plus (width, height).
+
+    Returns ``("", None)`` for remote URLs or unreadable files. Ratio bands:
+    within 10% of square → ``square``; wider → ``landscape``; taller →
+    ``portrait`` (matches how the tool layer names the three options).
+    """
+    ref = (image or "").strip()
+    if not ref or ref.lower().startswith(("http://", "https://", "data:")):
+        return "", None
+    try:
+        from PIL import Image
+        with Image.open(ref) as img:
+            w, h = img.size
+    except Exception:
+        return "", None
+    if not w or not h:
+        return "", None
+    ratio = w / h
+    if 0.9 <= ratio <= 1.1:
+        return "square", (w, h)
+    return ("landscape" if ratio > 1 else "portrait"), (w, h)
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +372,21 @@ def _build_image_provider():
                     return error_response(error="Relay returned neither b64_json nor url",
                                           error_type="provider_error", provider=self.name,
                                           model=model_id, prompt=prompt, aspect_ratio=aspect)
+                # The relay drops size/quality for gpt-image on text->image
+                # (returns ~square regardless), while honouring it on edits.
+                # Report the aspect the caller actually got, and the requested
+                # one alongside, so the agent does not describe a square as
+                # "portrait".
+                actual_aspect, dims = _measure_aspect(image)
+                extra: Dict[str, Any] = {"requested_aspect_ratio": aspect}
+                if dims:
+                    extra["width"], extra["height"] = dims
+                if actual_aspect and actual_aspect != aspect and dims:
+                    logger.info("hutch image: requested %s, relay returned %s (%sx%s) for %s",
+                                aspect, actual_aspect, dims[0], dims[1], model_id)
                 return success_response(image=image, model=model_id, prompt=prompt,
-                                        aspect_ratio=aspect, provider=self.name, modality=modality)
+                                        aspect_ratio=actual_aspect or aspect,
+                                        provider=self.name, modality=modality, extra=extra)
             except Exception as exc:
                 return error_response(error=str(exc), error_type=type(exc).__name__,
                                       provider=self.name, model=model_id, prompt=prompt,

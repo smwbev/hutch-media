@@ -401,7 +401,82 @@ def test_image_aspect_ratio_maps_to_relay_size(providers, monkeypatch, tmp_path)
         out = image.generate("a tower", aspect)
         assert out["success"], out
         assert seen["json"]["size"] == size, aspect
+        # remote URL result: dimensions unknown, requested aspect is reported
         assert out["aspect_ratio"] == aspect
+        assert out["requested_aspect_ratio"] == aspect
+
+
+def _png_bytes(w: int, h: int, mode: str = "RGB") -> bytes:
+    from io import BytesIO
+    from PIL import Image
+    img = Image.effect_noise((w, h), 64).convert(mode)  # noise: incompressible as PNG
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_large_local_image_is_recompressed_for_inline(plugin, providers, monkeypatch, tmp_path):
+    """Hermes' cache emits 2-3 MB PNGs; the relay rejects a 3 MB+ body on
+    /videos/generations ("length limit exceeded"). Oversized inputs must be
+    downscaled + JPEG-encoded under the inline budget; small inputs stay
+    byte-exact."""
+    from io import BytesIO
+    from PIL import Image
+    _, video = providers
+    big = tmp_path / "big.png"
+    big.write_bytes(_png_bytes(2048, 2048, "RGBA"))  # alpha too: must flatten
+    assert big.stat().st_size > plugin._INLINE_MAX_RAW_BYTES
+
+    submit = MagicMock(status_code=200)
+    submit.json.return_value = {"request_id": "r", "status": "completed",
+                                "video": {"url": "https://cdn.example/v.mp4"}}
+    seen = {}
+    import requests
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (seen.update(json=kw.get("json")), submit)[1])
+    import agent.video_gen_provider as vgp
+    monkeypatch.setattr(vgp, "save_url_video", lambda url, prefix: url)
+
+    out = video.generate("animate", image_url=str(big))
+    assert out["success"], out
+    uri = seen["json"]["image"]["url"]
+    assert uri.startswith("data:image/jpeg;base64,")
+    payload = base64.b64decode(uri.split(",", 1)[1])
+    assert len(payload) <= plugin._INLINE_MAX_RAW_BYTES
+    with Image.open(BytesIO(payload)) as im:
+        assert max(im.size) <= plugin._INLINE_MAX_SIDE_PX
+        assert im.mode == "RGB"
+
+    # small file: inlined byte-exact with its own mime
+    small = tmp_path / "small.png"
+    small.write_bytes(_png_bytes(64, 64))
+    out = video.generate("animate", image_url=str(small))
+    assert out["success"], out
+    uri = seen["json"]["image"]["url"]
+    assert uri == "data:image/png;base64," + base64.b64encode(small.read_bytes()).decode("ascii")
+
+
+def test_image_response_reports_actual_aspect(providers, monkeypatch, tmp_path):
+    """The relay drops `size` for gpt-image text->image and returns ~square.
+    A saved result must report the aspect the caller actually GOT (plus the
+    requested one), never label a square as portrait."""
+    image, _ = providers
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    square_b64 = base64.b64encode(_png_bytes(1312, 1199)).decode("ascii")
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"data": [{"b64_json": square_b64}]}
+    import requests
+    monkeypatch.setattr(requests, "post", lambda url, **kw: resp)
+    out = image.generate("a tower", "portrait")
+    assert out["success"], out
+    assert out["requested_aspect_ratio"] == "portrait"
+    assert out["aspect_ratio"] == "square"
+    assert (out["width"], out["height"]) == (1312, 1199)
+
+    tall_b64 = base64.b64encode(_png_bytes(1024, 1536)).decode("ascii")
+    resp.json.return_value = {"data": [{"b64_json": tall_b64}]}
+    out = image.generate("a tower", "portrait")
+    assert out["aspect_ratio"] == "portrait" and out["requested_aspect_ratio"] == "portrait"
 
 
 def test_unavailable_without_env(plugin, monkeypatch):
