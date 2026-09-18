@@ -406,6 +406,53 @@ def test_image_aspect_ratio_maps_to_relay_size(providers, monkeypatch, tmp_path)
         assert out["requested_aspect_ratio"] == aspect
 
 
+def test_text_to_image_prompt_carries_orientation_hint(plugin, providers, monkeypatch, tmp_path):
+    """The Codex backend behind gpt-image ignores `size` and picks the aspect
+    from the prompt text (measured 18/18 square for a neutral prompt, 12/12
+    correct with the hint). Text->image must append the orientation sentence
+    for non-square requests, leave square and the user's text untouched, and
+    disclose the hint in the response. Edits honour `size` — no hint there."""
+    image, _ = providers
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"data": [{"url": "https://relay.test.example/out.png"}]}
+    seen = {}
+    import requests
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (seen.update(json=kw.get("json")), resp)[1])
+
+    out = image.generate("a red circle", "portrait")
+    assert seen["json"]["prompt"] == "a red circle. " + plugin._ORIENTATION_HINTS["portrait"]
+    assert out["prompt"] == "a red circle"                 # the user's prompt is echoed unmodified
+    assert out["prompt_orientation_hint"] == plugin._ORIENTATION_HINTS["portrait"]
+
+    out = image.generate("a red circle.", "landscape")     # trailing period not doubled
+    assert seen["json"]["prompt"] == "a red circle. " + plugin._ORIENTATION_HINTS["landscape"]
+
+    out = image.generate("a red circle!", "portrait")      # '!' / '?' kept, no stray period
+    assert seen["json"]["prompt"] == "a red circle! " + plugin._ORIENTATION_HINTS["portrait"]
+    out = image.generate("what is red?", "portrait")
+    assert seen["json"]["prompt"] == "what is red? " + plugin._ORIENTATION_HINTS["portrait"]
+
+    out = image.generate("a red circle", "square")
+    assert seen["json"]["prompt"] == "a red circle"
+    assert "prompt_orientation_hint" not in out
+
+    # gated to the gpt-image family: the xAI branch derives aspect from size
+    out = image.generate("a red circle", "portrait", model="x-ai/grok-imagine-image")
+    assert seen["json"]["prompt"] == "a red circle"
+    assert seen["json"]["size"] == "1024x1536"
+    assert "prompt_orientation_hint" not in out
+    out = image.generate("a red circle", "portrait", model="openai/gpt-image-2.5-sunburst")
+    assert seen["json"]["prompt"].endswith(plugin._ORIENTATION_HINTS["portrait"])
+
+    # edit path: size does the job, prompt stays verbatim
+    out = image.generate("make it blue", "portrait", image_url="https://x.example/in.png")
+    assert seen["json"]["prompt"] == "make it blue"
+    assert seen["json"]["size"] == "1024x1536"
+    assert "prompt_orientation_hint" not in out
+
+
 def _png_bytes(w: int, h: int, mode: str = "RGB") -> bytes:
     from io import BytesIO
     from PIL import Image

@@ -224,6 +224,33 @@ _IMAGE_SIZES: Dict[str, str] = {
     "portrait": "1024x1536",
 }
 
+# Orientation sentence appended to text->image prompts. Measured on the relay
+# (gpt-image-2, 3 runs each): a neutral prompt returned 1254x1254 for every
+# `size` (18/18); with this exact wording the output matched `size` pixel-for-
+# pixel (12/12), including prompts whose subject pulls the other way ("macro
+# photo" -> portrait, "tall lighthouse" -> landscape). The ratio words matter:
+# "wider than tall" alone gave non-standard 1774x887-class sizes; a prefix
+# instead of a suffix gave 941x1672. Keep this wording unless re-measured.
+_ORIENTATION_HINTS: Dict[str, str] = {
+    "portrait": "Vertical portrait orientation, 2:3 aspect ratio.",
+    "landscape": "Wide horizontal landscape orientation, 3:2 aspect ratio.",
+}
+
+
+def _is_gpt_image_model(model_id: str) -> bool:
+    """True for the OpenAI gpt-image family (``openai/gpt-image-2``,
+    ``gpt-image-2.5-sunburst`` …) — the only relay branch measured to ignore
+    ``size`` on text->image. Same prefix match as ``_family_meta``."""
+    return model_id.rsplit("/", 1)[-1].lower().startswith("gpt-image")
+
+
+def _join_hint(prompt: str, hint: str) -> str:
+    """Append the orientation sentence without doubling terminal punctuation
+    (``prompt`` is already stripped by the caller)."""
+    body = prompt.rstrip(".")
+    tail = "" if body and body[-1] in "!?" else "."
+    return f"{body}{tail} {hint}"
+
 
 def _measure_aspect(image: str) -> Tuple[str, Optional[Tuple[int, int]]]:
     """Canonical aspect name for a LOCAL image file, plus (width, height).
@@ -333,6 +360,7 @@ def _build_image_provider():
                 sources.append(image_url)
             sources.extend(normalize_reference_images(reference_image_urls) or [])
             modality = "image" if sources else "text"
+            applied_hint = ""
             try:
                 size = _IMAGE_SIZES.get(aspect)
                 if sources:
@@ -349,7 +377,21 @@ def _build_image_provider():
                     }
                     endpoint = f"{_base_url()}/images/edits"
                 else:
-                    payload = {"model": model_id, "prompt": prompt}
+                    # Text->image: the Codex/ChatGPT backend behind gpt-image
+                    # ignores the tool's `size` and picks the aspect from the
+                    # prompt text (measured: a neutral prompt gave 1254x1254
+                    # for every size, 18/18; the same prompt with an
+                    # orientation sentence matched size exactly, 12/12). Append
+                    # an orientation hint for non-square gpt-image requests.
+                    # Gated to that family: the xAI branch derives aspect from
+                    # `size` itself (unmeasured for grok/muse — no mutation
+                    # there). Edits honour `size` on their own — not hinted.
+                    applied_hint = (
+                        _ORIENTATION_HINTS.get(aspect, "")
+                        if _is_gpt_image_model(model_id) else ""
+                    )
+                    sent_prompt = _join_hint(prompt, applied_hint) if applied_hint else prompt
+                    payload = {"model": model_id, "prompt": sent_prompt}
                     endpoint = f"{_base_url()}/images/generations"
                 if size:
                     # size is the one aspect carrier every relay branch reads
@@ -379,6 +421,8 @@ def _build_image_provider():
                 # "portrait".
                 actual_aspect, dims = _measure_aspect(image)
                 extra: Dict[str, Any] = {"requested_aspect_ratio": aspect}
+                if applied_hint:
+                    extra["prompt_orientation_hint"] = applied_hint
                 if dims:
                     extra["width"], extra["height"] = dims
                 if actual_aspect and actual_aspect != aspect and dims:
