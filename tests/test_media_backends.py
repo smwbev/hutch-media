@@ -5,6 +5,7 @@ Run from a hermes-agent checkout:
     PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -o 'addopts='
 """
 
+import base64
 import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -283,12 +284,18 @@ def test_video_poll_fails_fast_on_persistent_4xx(plugin, providers, monkeypatch)
     assert counts["gets"] == plugin._POLL_MAX_CONSECUTIVE_4XX
 
 
-def test_video_failed_status_is_clean_error(providers, monkeypatch):
+def test_video_failed_status_surfaces_relay_error_message(providers, monkeypatch):
+    """A failed job must carry the relay's error.message, not a generic line —
+    the actionable cause ("image_url must be base64 or URL") otherwise needs a
+    manual GET to recover."""
     _, video = providers
     submit_resp = MagicMock(status_code=200)
     submit_resp.json.return_value = {"request_id": "req-9", "status": "queued"}
     poll_resp = MagicMock(status_code=200)
-    poll_resp.json.return_value = {"status": "failed"}
+    poll_resp.json.return_value = {
+        "status": "failed",
+        "error": {"message": "image_url must be base64 or URL", "code": "invalid_input"},
+    }
 
     import requests
     monkeypatch.setattr(requests, "post", lambda url, **kw: submit_resp)
@@ -297,6 +304,104 @@ def test_video_failed_status_is_clean_error(providers, monkeypatch):
     out = video.generate("nope")
     assert not out["success"]
     assert out["error_type"] == "provider_error"
+    assert "image_url must be base64 or URL" in out["error"]
+    assert "req-9" in out["error"]
+
+
+def test_local_image_paths_are_inlined_as_data_uris(providers, monkeypatch, tmp_path):
+    """Hermes tools hand providers LOCAL paths for cached images; the relay
+    rejects bare paths. Both image edit and video i2v/refs must inline them
+    as data URIs while passing URLs and existing data URIs through."""
+    image, video = providers
+    png = tmp_path / "in.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    expected_b64 = base64.b64encode(png.read_bytes()).decode("ascii")
+    expected_uri = f"data:image/png;base64,{expected_b64}"
+
+    import requests
+    # --- image edit ---
+    img_resp = MagicMock(status_code=200)
+    img_resp.json.return_value = {"data": [{"url": "https://relay.test.example/out.png"}]}
+    seen_img = {}
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (seen_img.update(json=kw.get("json")), img_resp)[1])
+    out = image.generate("edit", "square", image_url=str(png),
+                         reference_image_urls=["https://x.example/ref.png"])
+    assert out["success"], out
+    assert seen_img["json"]["images"] == [
+        {"image_url": expected_uri},
+        {"image_url": "https://x.example/ref.png"},  # URL passes through untouched
+    ]
+
+    # --- video i2v + refs ---
+    vid_resp = MagicMock(status_code=200)
+    vid_resp.json.return_value = {
+        "request_id": "req-i2v", "status": "completed",
+        "video": {"url": "https://cdn.example/v.mp4"},
+    }
+    seen_vid = {}
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (seen_vid.update(json=kw.get("json")), vid_resp)[1])
+    import agent.video_gen_provider as vgp
+    monkeypatch.setattr(vgp, "save_url_video", lambda url, prefix: url)
+    out = video.generate("animate", image_url=str(png))
+    assert out["success"], out
+    assert seen_vid["json"]["image"] == {"url": expected_uri}
+
+    out = video.generate("blend", reference_image_urls=[str(png), "https://x.example/b.png"])
+    assert out["success"], out
+    assert seen_vid["json"]["reference_images"] == [
+        {"url": expected_uri}, {"url": "https://x.example/b.png"}]
+
+
+def test_local_image_read_respects_file_safety_guard(providers, monkeypatch, tmp_path):
+    """The shared credential-read guard must run before local bytes are read
+    (same boundary the bundled xAI/OpenRouter providers apply)."""
+    image, _ = providers
+    png = tmp_path / "secret.png"
+    png.write_bytes(b"x")
+    import agent.file_safety as fs
+    calls = []
+
+    def blocked(path):
+        calls.append(path)
+        raise PermissionError("blocked by file_safety")
+
+    monkeypatch.setattr(fs, "raise_if_read_blocked", blocked)
+    import requests
+    monkeypatch.setattr(requests, "post", lambda url, **kw: pytest.fail("must not reach the relay"))
+    out = image.generate("edit", "square", image_url=str(png))
+    assert not out["success"]
+    assert "blocked by file_safety" in out["error"]
+    assert calls and calls[0] == str(png)
+    # video path honours the same contract: error_response, never a raised
+    # exception escaping generate()
+    _, video = providers
+    out = video.generate("animate", image_url=str(png))
+    assert not out["success"]
+    assert "blocked by file_safety" in out["error"]
+    out = video.generate("blend", reference_image_urls=[str(png)])
+    assert not out["success"]
+    assert "blocked by file_safety" in out["error"]
+
+
+def test_image_aspect_ratio_maps_to_relay_size(providers, monkeypatch, tmp_path):
+    """Text->image must carry the aspect as `size` (the one field every relay
+    branch reads: xAI derives aspect_ratio from it, OpenAI forwards it)."""
+    image, _ = providers
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"data": [{"url": "https://relay.test.example/out.png"}]}
+    seen = {}
+    import requests
+    monkeypatch.setattr(requests, "post",
+                        lambda url, **kw: (seen.update(json=kw.get("json")), resp)[1])
+    for aspect, size in (("portrait", "1024x1536"), ("landscape", "1536x1024"),
+                         ("square", "1024x1024")):
+        out = image.generate("a tower", aspect)
+        assert out["success"], out
+        assert seen["json"]["size"] == size, aspect
+        assert out["aspect_ratio"] == aspect
 
 
 def test_unavailable_without_env(plugin, monkeypatch):

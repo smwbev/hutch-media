@@ -19,9 +19,12 @@ companion ``hutch`` model provider from smwbev/hutch-provider).
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -121,6 +124,45 @@ def _is_media_model(base_id: str, token: str) -> bool:
     return not any(bad in base_id for bad in _NON_MEDIA_TOKENS)
 
 
+def _inline_image_ref(value: str) -> str:
+    """Return a URL / data-URI the relay accepts for an image input.
+
+    Hermes' image/video tools pass LOCAL ABSOLUTE PATHS for cached images
+    (the documented ``image_url`` contract); the relay only accepts public
+    URLs or ``data:`` URIs and 400s / fails the job on a bare path. Mirror the
+    bundled xAI/OpenRouter providers: pass URLs and data URIs through, read a
+    local file behind the shared credential-read guard and inline it as a
+    base64 data URI.
+    """
+    ref = (value or "").strip()
+    if not ref:
+        return ""
+    lower = ref.lower()
+    if lower.startswith(("http://", "https://", "data:")):
+        return ref
+    path = Path(ref).expanduser()
+    if not path.is_file():
+        return ref  # not a local file — let the relay report the real error
+    from agent.file_safety import raise_if_read_blocked
+    raise_if_read_blocked(str(path))
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        mime = "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+# Hermes canonical aspect names → relay ``size`` (the xAI branch derives
+# aspect_ratio from size via xaiImagesAspectRatioFromSize; the OpenAI/codex
+# branch forwards size verbatim to gpt-image). Same table as the bundled
+# openai image plugin.
+_IMAGE_SIZES: Dict[str, str] = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+}
+
+
 # ---------------------------------------------------------------------------
 # Image
 # ---------------------------------------------------------------------------
@@ -206,6 +248,7 @@ def _build_image_provider():
             sources.extend(normalize_reference_images(reference_image_urls) or [])
             modality = "image" if sources else "text"
             try:
+                size = _IMAGE_SIZES.get(aspect)
                 if sources:
                     # CLIProxyAPI's /images/edits JSON parsing: the xAI branch
                     # (collectXAIImagesFromJSON) accepts images[] items as
@@ -213,14 +256,19 @@ def _build_image_provider():
                     # the generic fallback branch reads ONLY images[].image_url.
                     # ``images: [{"image_url": url}]`` is the one shape parsed
                     # by every branch (verified against openai_images_handlers.go).
+                    # Local paths are inlined as data URIs (relay rejects paths).
                     payload: Dict[str, Any] = {
                         "model": model_id, "prompt": prompt,
-                        "images": [{"image_url": u} for u in sources[:4]],
+                        "images": [{"image_url": _inline_image_ref(u)} for u in sources[:4]],
                     }
                     endpoint = f"{_base_url()}/images/edits"
                 else:
                     payload = {"model": model_id, "prompt": prompt}
                     endpoint = f"{_base_url()}/images/generations"
+                if size:
+                    # size is the one aspect carrier every relay branch reads
+                    # (xAI derives aspect_ratio from it; OpenAI forwards it).
+                    payload["size"] = size
                 response = requests.post(endpoint, headers=_headers(), json=payload,
                                          timeout=_REQUEST_TIMEOUT)
                 if response.status_code >= 400:
@@ -352,11 +400,25 @@ def _build_video_provider():
                 # handleXAIVideosNativePost forwards rawJSON untranslated;
                 # the xAI executor's normalizeXAIImageRefs passes image.url
                 # through as-is). The OpenAI-ism input_reference.image_url is
-                # translated ONLY on /openai/v1/videos — not here.
-                payload["image"] = {"url": image_url}
+                # translated ONLY on /openai/v1/videos — not here. Local
+                # paths are inlined as data URIs (upstream fails the job on a
+                # bare path: "image_url must be base64 or URL"). Inlining can
+                # raise (file_safety guard, unreadable file) — keep the
+                # VideoGenProvider contract and return error_response.
+                try:
+                    payload["image"] = {"url": _inline_image_ref(image_url)}
+                except Exception as exc:
+                    return error_response(error=str(exc), error_type=type(exc).__name__,
+                                          provider=self.name, model=model_id, prompt=prompt,
+                                          aspect_ratio=aspect_ratio)
             if reference_image_urls:
-                payload["reference_images"] = [
-                    {"url": u} for u in list(reference_image_urls)[:3]]
+                try:
+                    payload["reference_images"] = [
+                        {"url": _inline_image_ref(u)} for u in list(reference_image_urls)[:3]]
+                except Exception as exc:
+                    return error_response(error=str(exc), error_type=type(exc).__name__,
+                                          provider=self.name, model=model_id, prompt=prompt,
+                                          aspect_ratio=aspect_ratio)
             if duration:
                 # Native xAI dictionary: numeric "duration" ("seconds" is an
                 # OpenAI-ism parsed only by the /openai/v1/videos translator).
@@ -379,11 +441,12 @@ def _build_video_provider():
                 body = submit.json()
                 request_id = str(body.get("request_id") or body.get("id") or "").strip()
                 video_url = self._extract_video_url(body)
+                poll_error = ""
                 if not video_url and request_id:
-                    video_url = self._poll(request_id)
+                    video_url, poll_error = self._poll(request_id)
                 if not video_url:
-                    return error_response(error="Relay returned no video URL "
-                                                f"(request_id={request_id or 'none'})",
+                    reason = poll_error or "Relay returned no video URL"
+                    return error_response(error=f"{reason} (request_id={request_id or 'none'})",
                                           error_type="provider_error", provider=self.name,
                                           model=model_id, prompt=prompt, aspect_ratio=aspect_ratio)
                 # Relay URLs are often short-lived — persist into the cache.
@@ -417,8 +480,30 @@ def _build_video_provider():
                 return str(data[0].get("url") or "").strip()
             return ""
 
-        def _poll(self, request_id: str) -> str:
+        @staticmethod
+        def _failure_reason(body: Dict[str, Any]) -> str:
+            """Human-readable failure text from a relay/xAI poll body."""
+            err = body.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("detail") or err.get("code")
+                if msg:
+                    return str(msg)
+            if isinstance(err, str) and err.strip():
+                return err.strip()
+            for key in ("failure_reason", "message", "detail"):
+                val = body.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            return "Video generation failed on the relay"
+
+        def _poll(self, request_id: str) -> Tuple[str, str]:
             """Poll ``GET /videos/:request_id`` with the SAME key until terminal.
+
+            Returns ``(video_url, error)``: exactly one is non-empty on a
+            terminal outcome; both empty means the deadline passed. The relay's
+            ``error.message`` on a failed job is surfaced instead of swallowed —
+            it carries the actionable cause (e.g. "image_url must be base64 or
+            URL"), which otherwise required a manual GET to recover.
 
             Non-transient 4xx (401/403/404 — e.g. a lost in-memory auth binding
             after a relay restart) fail fast after a few consecutive hits
@@ -427,6 +512,7 @@ def _build_video_provider():
             deadline = time.monotonic() + _POLL_DEADLINE_S
             consecutive_4xx = 0
             first = True
+            last_status = 0
             while time.monotonic() < deadline:
                 if first:
                     first = False  # poll immediately: fast jobs finish in seconds
@@ -435,6 +521,7 @@ def _build_video_provider():
                 try:
                     poll = requests.get(f"{_base_url()}/videos/{request_id}",
                                         headers=_headers(), timeout=30)
+                    last_status = poll.status_code
                     if 400 <= poll.status_code < 500:
                         consecutive_4xx += 1
                         logger.debug("hutch video poll %s: HTTP %s (%d consecutive)",
@@ -443,7 +530,8 @@ def _build_video_provider():
                             logger.warning("hutch video poll %s: giving up after %d consecutive "
                                            "HTTP %s responses", request_id, consecutive_4xx,
                                            poll.status_code)
-                            return ""
+                            return "", (f"Polling failed: HTTP {poll.status_code} "
+                                        f"x{consecutive_4xx}: {poll.text[:200]}")
                         continue
                     if poll.status_code >= 500:
                         consecutive_4xx = 0  # upstream hiccup, not an auth/routing failure
@@ -455,12 +543,12 @@ def _build_video_provider():
                     logger.debug("hutch video poll %s failed: %s", request_id, exc)
                     continue
                 status = str(body.get("status") or "").lower()
-                if status == "failed":
-                    return ""
+                if status in {"failed", "error", "expired", "cancelled", "canceled"}:
+                    return "", self._failure_reason(body)
                 url = self._extract_video_url(body)
                 if url and status in {"", "completed", "succeeded", "done"}:
-                    return url
-            return ""
+                    return url, ""
+            return "", f"Timed out after {int(_POLL_DEADLINE_S)}s (last HTTP {last_status})"
 
     return HutchVideoGenProvider()
 
