@@ -472,9 +472,12 @@ def _build_video_provider():
                 if base in seen:
                     continue
                 seen.add(base)
+                strengths = "Relay video model"
+                if _video_edit_model_ok(model_id):
+                    strengths += "; supports editing (hutch_video_edit)"
                 rows.append({
                     "id": model_id, "display": model_id,
-                    "strengths": "Relay video model", "modalities": ["text", "image"],
+                    "strengths": strengths, "modalities": ["text", "image"],
                 })
             return rows
 
@@ -491,6 +494,10 @@ def _build_video_provider():
                 "supports_audio": False,
                 "supports_negative_prompt": False,
                 "max_reference_images": 3,
+                # Self-documenting (the core tool layer does not read these):
+                # editing is a separate tool, hutch_video_edit.
+                "supports_edit": True,
+                "edit_models": sorted(_VIDEO_EDIT_MODELS),
             }
 
         def get_setup_schema(self) -> Dict[str, Any]:
@@ -609,94 +616,390 @@ def _build_video_provider():
 
         @staticmethod
         def _extract_video_url(body: Dict[str, Any]) -> str:
-            """Video URL from a submit/poll payload; '' when not (yet) present."""
-            for path in (("video", "url"), ("output", "url"), ("url",), ("video_url",)):
-                node: Any = body
-                for key in path:
-                    node = node.get(key) if isinstance(node, dict) else None
-                    if node is None:
-                        break
-                if isinstance(node, str) and node.strip():
-                    return node.strip()
-            data = body.get("data")
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                return str(data[0].get("url") or "").strip()
-            return ""
+            return _extract_video_url(body)
 
         @staticmethod
         def _failure_reason(body: Dict[str, Any]) -> str:
-            """Human-readable failure text from a relay/xAI poll body."""
-            err = body.get("error")
-            if isinstance(err, dict):
-                msg = err.get("message") or err.get("detail") or err.get("code")
-                if msg:
-                    return str(msg)
-            if isinstance(err, str) and err.strip():
-                return err.strip()
-            for key in ("failure_reason", "message", "detail"):
-                val = body.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            return "Video generation failed on the relay"
+            return _failure_reason(body)
 
         def _poll(self, request_id: str) -> Tuple[str, str]:
-            """Poll ``GET /videos/:request_id`` with the SAME key until terminal.
-
-            Returns ``(video_url, error)``: exactly one is non-empty on a
-            terminal outcome; both empty means the deadline passed. The relay's
-            ``error.message`` on a failed job is surfaced instead of swallowed —
-            it carries the actionable cause (e.g. "image_url must be base64 or
-            URL"), which otherwise required a manual GET to recover.
-
-            Non-transient 4xx (401/403/404 — e.g. a lost in-memory auth binding
-            after a relay restart) fail fast after a few consecutive hits
-            instead of spinning to the 15-minute deadline."""
-            import requests
-            deadline = time.monotonic() + _POLL_DEADLINE_S
-            consecutive_4xx = 0
-            first = True
-            last_status = 0
-            while time.monotonic() < deadline:
-                if first:
-                    first = False  # poll immediately: fast jobs finish in seconds
-                else:
-                    time.sleep(_POLL_INTERVAL_S)
-                try:
-                    poll = requests.get(f"{_base_url()}/videos/{request_id}",
-                                        headers=_headers(), timeout=30)
-                    last_status = poll.status_code
-                    if 400 <= poll.status_code < 500:
-                        consecutive_4xx += 1
-                        logger.debug("hutch video poll %s: HTTP %s (%d consecutive)",
-                                     request_id, poll.status_code, consecutive_4xx)
-                        if consecutive_4xx >= _POLL_MAX_CONSECUTIVE_4XX:
-                            logger.warning("hutch video poll %s: giving up after %d consecutive "
-                                           "HTTP %s responses", request_id, consecutive_4xx,
-                                           poll.status_code)
-                            return "", (f"Polling failed: HTTP {poll.status_code} "
-                                        f"x{consecutive_4xx}: {poll.text[:200]}")
-                        continue
-                    if poll.status_code >= 500:
-                        consecutive_4xx = 0  # upstream hiccup, not an auth/routing failure
-                        logger.debug("hutch video poll %s: HTTP %s", request_id, poll.status_code)
-                        continue
-                    consecutive_4xx = 0
-                    body = poll.json()
-                except Exception as exc:
-                    logger.debug("hutch video poll %s failed: %s", request_id, exc)
-                    continue
-                status = str(body.get("status") or "").lower()
-                if status in {"failed", "error", "expired", "cancelled", "canceled"}:
-                    return "", self._failure_reason(body)
-                url = self._extract_video_url(body)
-                if url and status in {"", "completed", "succeeded", "done"}:
-                    return url, ""
-            return "", f"Timed out after {int(_POLL_DEADLINE_S)}s (last HTTP {last_status})"
+            return _poll_video(request_id)
 
     return HutchVideoGenProvider()
 
 
+# ---------------------------------------------------------------------------
+# Shared video polling (used by the video_gen provider and hutch_video_edit)
+# ---------------------------------------------------------------------------
+
+
+def _extract_video_url(body: Dict[str, Any]) -> str:
+    """Video URL from a submit/poll payload; '' when not (yet) present."""
+    for path in (("video", "url"), ("output", "url"), ("url",), ("video_url",)):
+        node: Any = body
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, str) and node.strip():
+            return node.strip()
+    data = body.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return str(data[0].get("url") or "").strip()
+    return ""
+
+
+def _failure_reason(body: Dict[str, Any]) -> str:
+    """Human-readable failure text from a relay/xAI poll body."""
+    err = body.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("detail") or err.get("code")
+        if msg:
+            return str(msg)
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    for key in ("failure_reason", "message", "detail"):
+        val = body.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return "Video generation failed on the relay"
+
+
+def _poll_video(request_id: str, *, final_body: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Poll ``GET /videos/:request_id`` with the SAME key until terminal.
+
+    Returns ``(video_url, error)``: exactly one is non-empty on a terminal
+    outcome; both empty means the deadline passed. When ``final_body`` (a
+    caller-owned dict) is given, the terminal poll body is copied into it so
+    callers can read metadata such as ``video.duration``. The relay's
+    ``error.message`` on a failed job is surfaced instead of swallowed — it
+    carries the actionable cause (e.g. "image_url must be base64 or URL"),
+    which otherwise required a manual GET to recover.
+
+    Non-transient 4xx fail fast after a few consecutive hits instead of
+    spinning to the 15-minute deadline. The relay binds ``request_id`` to an
+    upstream account IN MEMORY with a 3h TTL (``videoAuthBindings``), so a
+    relay restart or an expired binding turns every poll into a 4xx — the
+    error text says so. Statuses are the raw xAI dictionary (``done``), not
+    normalised — the native ``/v1/videos/:id`` route does not translate them.
+    """
+    import requests
+    deadline = time.monotonic() + _POLL_DEADLINE_S
+    consecutive_4xx = 0
+    first = True
+    last_status = 0
+    while time.monotonic() < deadline:
+        if first:
+            first = False  # poll immediately: fast jobs finish in seconds
+        else:
+            time.sleep(_POLL_INTERVAL_S)
+        try:
+            poll = requests.get(f"{_base_url()}/videos/{request_id}",
+                                headers=_headers(), timeout=30)
+            last_status = poll.status_code
+            if 400 <= poll.status_code < 500:
+                consecutive_4xx += 1
+                logger.debug("hutch video poll %s: HTTP %s (%d consecutive)",
+                             request_id, poll.status_code, consecutive_4xx)
+                if consecutive_4xx >= _POLL_MAX_CONSECUTIVE_4XX:
+                    logger.warning("hutch video poll %s: giving up after %d consecutive "
+                                   "HTTP %s responses", request_id, consecutive_4xx,
+                                   poll.status_code)
+                    return "", (f"Polling rejected: HTTP {poll.status_code} x{consecutive_4xx} "
+                                f"({poll.text[:200]}) — the relay was restarted or its 3h "
+                                f"auth binding for this request expired; resubmit the job")
+                continue
+            if poll.status_code >= 500:
+                consecutive_4xx = 0  # upstream hiccup, not an auth/routing failure
+                logger.debug("hutch video poll %s: HTTP %s", request_id, poll.status_code)
+                continue
+            consecutive_4xx = 0
+            body = poll.json()
+            if not isinstance(body, dict):
+                raise ValueError(f"non-object poll body: {type(body).__name__}")
+        except Exception as exc:
+            logger.debug("hutch video poll %s failed: %s", request_id, exc)
+            continue
+        status = str(body.get("status") or "").lower()
+        if status in {"failed", "error", "expired", "cancelled", "canceled"}:
+            if final_body is not None:
+                final_body.update(body)
+            return "", _failure_reason(body)
+        url = _extract_video_url(body)
+        if url and status in {"", "completed", "succeeded", "done"}:
+            if final_body is not None:
+                final_body.update(body)
+            return url, ""
+    return "", f"Timed out after {int(_POLL_DEADLINE_S)}s (last HTTP {last_status})"
+
+
+# ---------------------------------------------------------------------------
+# hutch_video_edit — generative video editing on POST /videos/edits
+# ---------------------------------------------------------------------------
+
+# The only model xAI documents for editing (docs.x.ai …/video/editing):
+# grok-imagine-video-1.5 / -1.5-preview answer HTTP 400 "Video editing is not
+# supported for this model" — from xAI, before billing. Static on purpose:
+# the relay's /models catalog is unstable (depends on which xAI accounts are
+# live), while the base model answers on /videos/edits even when absent from
+# the list (built-in in the relay's registry). Extend after re-running the
+# live probe in tests/test_video_edit_live.py.
+_VIDEO_EDIT_MODELS = frozenset({"grok-imagine-video"})
+_VIDEO_EDIT_MODEL_PREFIXES = frozenset({"", "xai", "x-ai", "grok"})  # = relay isXAIVideosModel
+_DEFAULT_VIDEO_EDIT_MODEL = "grok-imagine-video"
+# Empirical: an 11.3 MB data:video/mp4 body was accepted on /videos/edits
+# (the relay has no MaxBytesReader there; the limit sits upstream). 20 MB is a
+# soft guard against blind multi-minute uploads, not a measured ceiling.
+_VIDEO_EDIT_MAX_BYTES = 20 * 1024 * 1024
+# xAI documents 2–15 s only for extension; edits were observed in the same
+# band. Outside it we WARN in the result, never block.
+_VIDEO_EDIT_DURATION_RANGE = (2.0, 15.0)
+
+# TODO(2026-09-18): hutch_video_extend — POST /videos/extensions returns 405
+# on every model. The relay routes it (xaiVideosExtensionsPath) but its
+# default upstream for xAI OAuth accounts, cli-chat-proxy.grok.com, does not
+# serve the route. Revisit once the relay carries an xAI account with a
+# direct API key (using_api: true); the probe is a one-line POST.
+
+HUTCH_VIDEO_EDIT_SCHEMA: Dict[str, Any] = {
+    "name": "hutch_video_edit",
+    "description": (
+        "Edit an existing video with a text instruction via the Hutch relay: add "
+        "objects, effects or weather, change style or lighting while keeping the "
+        "source motion. Output keeps the source duration (max 720p). Separate from "
+        "video_generate because editing is provider-specific. Returns the edited "
+        "video as an absolute local file path in `video`."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "What to change in the source video."},
+            "video_url": {
+                "type": "string",
+                "description": (
+                    "Source video: an absolute local .mp4 path (e.g. the `video` returned "
+                    "by video_generate) or a public HTTPS URL."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional relay model override. Only models that support editing are "
+                    "accepted (currently grok-imagine-video)."
+                ),
+            },
+        },
+        "required": ["prompt", "video_url"],
+    },
+}
+
+
+def _video_edit_model_ok(model_id: str) -> bool:
+    """Allow-list check with the relay's own prefix rules (isXAIVideosModel)."""
+    raw = (model_id or "").strip().lower()
+    prefix, _, base = raw.rpartition("/")
+    return base in _VIDEO_EDIT_MODELS and prefix in _VIDEO_EDIT_MODEL_PREFIXES
+
+
+def _video_edit_default_model() -> str:
+    """``video_gen.hutch.edit_model`` → built-in default.
+
+    Deliberately NOT ``video_gen.model``: that is the generation default
+    (typically grok-imagine-video-1.5), which cannot edit — inheriting it
+    would turn every edit into a pointless 400.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        scoped = ((cfg.get("video_gen") or {}).get("hutch") or {}).get("edit_model")
+        if isinstance(scoped, str) and scoped.strip():
+            return scoped.strip()
+    except Exception:
+        pass
+    return _DEFAULT_VIDEO_EDIT_MODEL
+
+
+def _probe_video_duration(path: Path) -> Optional[float]:
+    """Duration in seconds via ffprobe when available; None otherwise."""
+    import shutil
+    import subprocess
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        return float(out) if out else None
+    except Exception:
+        return None
+
+
+def _inline_video_ref(value: str) -> Tuple[str, Dict[str, Any]]:
+    """Return ``(video_url_for_relay, meta)``; raises ValueError on bad input.
+
+    URLs pass through. A local ``.mp4`` is read behind the shared credential
+    guard and inlined as ``data:video/mp4;base64,…`` — a first-class input per
+    xAI docs, NOT re-encoded (the relay accepted 11 MB; transcoding would
+    degrade the source). ``meta`` carries size/duration warnings for the result.
+    """
+    ref = (value or "").strip()
+    meta: Dict[str, Any] = {}
+    if not ref:
+        raise ValueError("video_url is required")
+    lower = ref.lower()
+    if lower.startswith(("http://", "https://", "data:video/")):
+        return ref, meta
+    path = Path(ref).expanduser()
+    # Guard FIRST — before any stat/exists probe — so a denied path leaks
+    # neither its existence nor its size through the error text (the guard
+    # works on the resolved path and does not need the file to exist).
+    from agent.file_safety import raise_if_read_blocked
+    raise_if_read_blocked(str(path))
+    if not path.is_file():
+        raise ValueError(f"video_url is neither an http(s) URL nor an existing local file: {ref}")
+    if path.suffix.lower() != ".mp4":
+        raise ValueError("only .mp4 sources are accepted by the relay (H.264/H.265/AV1)")
+    size = path.stat().st_size
+    if size > _VIDEO_EDIT_MAX_BYTES:
+        raise ValueError(
+            f"source video is {size / 2**20:.1f} MB, above the {_VIDEO_EDIT_MAX_BYTES / 2**20:.0f} MB "
+            f"inline limit — shrink it first, e.g. ffmpeg -i in.mp4 -vf scale=-2:720 -crf 28 out.mp4"
+        )
+    dur = _probe_video_duration(path)
+    if dur is not None:
+        meta["source_duration"] = round(dur, 2)
+        lo, hi = _VIDEO_EDIT_DURATION_RANGE
+        if not (lo <= dur <= hi):
+            meta["warning"] = (f"source is {dur:.1f}s; the relay's editing model was observed "
+                               f"to accept {lo:.0f}–{hi:.0f}s clips")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/mp4;base64,{encoded}", meta
+
+
+def _check_hutch_video_edit() -> bool:
+    """Tool is offered only when hutch is the active video_gen provider and
+    the relay credentials resolve — read at call time, never at import."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return False
+    section = cfg.get("video_gen") if isinstance(cfg, dict) else None
+    if not (isinstance(section, dict) and section.get("provider") == "hutch"):
+        return False
+    return bool(_api_key() and _base_url())
+
+
+def _handle_hutch_video_edit(args: Dict[str, Any], **_kw: Any) -> str:
+    import json
+    import requests
+    from tools.registry import tool_error
+
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return tool_error("prompt is required", success=False, error_type="invalid_input")
+    if not (_api_key() and _base_url()):
+        return tool_error("HUTCH_API_KEY / HUTCH_BASE_URL not configured", success=False,
+                          error_type="missing_api_key")
+
+    model_id = str(args.get("model") or "").strip() or _video_edit_default_model()
+    if not _video_edit_model_ok(model_id):
+        return tool_error(
+            f"model {model_id!r} does not support video editing; accepted: "
+            f"{', '.join(sorted(_VIDEO_EDIT_MODELS))} (optionally prefixed xai/, x-ai/, grok/)",
+            success=False, error_type="model_not_editable",
+            editable_models=sorted(_VIDEO_EDIT_MODELS),
+        )
+
+    source = str(args.get("video_url") or "")
+    try:
+        video_ref, meta = _inline_video_ref(source)
+    except ValueError as exc:
+        etype = "video_too_large" if "inline limit" in str(exc) else "invalid_input"
+        return tool_error(str(exc), success=False, error_type=etype)
+    except Exception as exc:  # file_safety guard, unreadable file
+        return tool_error(str(exc), success=False, error_type=type(exc).__name__)
+
+    # Native xAI edit contract on the relay's untranslated /v1/videos/edits:
+    # exactly model + prompt + video.url. duration/aspect_ratio/resolution are
+    # ignored on edits per xAI docs (output inherits the source), and the
+    # OpenAI-isms (input_reference, seconds) are not translated on this route.
+    payload = {"model": model_id, "prompt": prompt, "video": {"url": video_ref}}
+    try:
+        submit = requests.post(f"{_base_url()}/videos/edits", headers=_headers(),
+                               json=payload, timeout=60)
+    except Exception as exc:
+        return tool_error(f"relay request failed: {exc}", success=False,
+                          error_type=type(exc).__name__)
+    if submit.status_code >= 400:
+        text = submit.text[:400]
+        etype = "model_not_editable" if "not supported for this model" in text else "provider_error"
+        return tool_error(f"HTTP {submit.status_code}: {text}", success=False, error_type=etype,
+                          model=model_id)
+    try:
+        body = submit.json()
+    except Exception:
+        return tool_error("relay returned a non-JSON submit response", success=False,
+                          error_type="provider_error", model=model_id)
+    if not isinstance(body, dict):
+        return tool_error(f"relay returned a non-object submit response ({type(body).__name__})",
+                          success=False, error_type="provider_error", model=model_id)
+    request_id = str(body.get("request_id") or body.get("id") or "").strip()
+    video_url = _extract_video_url(body)
+    poll_error = ""
+    final: Dict[str, Any] = dict(body)
+    if not video_url and request_id:
+        video_url, poll_error = _poll_video(request_id, final_body=final)
+    if not video_url:
+        return tool_error(f"{poll_error or 'relay returned no video URL'} "
+                          f"(request_id={request_id or 'none'})",
+                          success=False, error_type="provider_error", model=model_id)
+
+    try:
+        local = str(_vgp_module().save_url_video(video_url, prefix="hutch"))
+    except Exception:
+        local = video_url
+    result: Dict[str, Any] = {
+        "success": True,
+        "video": local,
+        "public_url": video_url,
+        "source_video": source,
+        "model": model_id,
+        "prompt": prompt,
+        "provider": "hutch",
+        "request_id": request_id,
+    }
+    # xAI reports the output length in the terminal poll body (video.duration).
+    vid = final.get("video")
+    dur = vid.get("duration") if isinstance(vid, dict) else None
+    if isinstance(dur, (int, float)):
+        result["duration"] = dur
+    result.update(meta)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _vgp_module():
+    """``agent.video_gen_provider`` resolved at call time (monkeypatch seam)."""
+    import agent.video_gen_provider as vgp
+    return vgp
+
+
 def register(ctx) -> None:
-    """Register both hutch media backends."""
+    """Register both hutch media backends and the video edit tool."""
     ctx.register_image_gen_provider(_build_image_provider())
     ctx.register_video_gen_provider(_build_video_provider())
+    # Provider-specific edit workflow, same toolset as video_generate so it is
+    # enabled together with it; check_fn gates on video_gen.provider == hutch.
+    ctx.register_tool(
+        name="hutch_video_edit",
+        toolset="video_gen",
+        schema=HUTCH_VIDEO_EDIT_SCHEMA,
+        handler=_handle_hutch_video_edit,
+        check_fn=_check_hutch_video_edit,
+        requires_env=[],
+        is_async=False,
+        description="Edit an existing video by text instruction via the Hutch relay",
+        emoji="🎬",
+    )

@@ -2,7 +2,7 @@
 
 Run from a hermes-agent checkout:
 
-    PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -o 'addopts='
+    PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q
 """
 
 import base64
@@ -39,12 +39,17 @@ class _Ctx:
     def __init__(self):
         self.image = []
         self.video = []
+        self.tools = {}
 
     def register_image_gen_provider(self, provider):
         self.image.append(provider)
 
     def register_video_gen_provider(self, provider):
         self.video.append(provider)
+
+    def register_tool(self, *, name, toolset, schema, handler, check_fn=None, **kw):
+        self.tools[name] = {"toolset": toolset, "schema": schema, "handler": handler,
+                            "check_fn": check_fn, **kw}
 
 
 @pytest.fixture()
